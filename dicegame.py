@@ -2,21 +2,24 @@ import random
 import numpy as np
 from collections import Counter
 
-class Game:
+class gameEnv:
     def __init__(self):
         self.board = np.zeros((5, 5), dtype=int)
+        self.current_dice = self.roll_dice()
 
     def roll_dice(self):
         return random.randint(1, 6) + random.randint(1, 6)
 
-    def get_empty_cells(self):
-        return list(zip(*np.where(self.board == 0)))
+    def get_valid_actions(self):
+        return [(r, c) for r in range(5) for c in range(5) if self.board[r, c] == 0]
     
     def end_game(self):
-        return len(self.get_empty_cells()) == 0
+        return len(self.get_valid_actions()) == 0
     
-    def reset_game(self):
+    def reset(self):
         self.board.fill(0)
+        self.current_dice = self.roll_dice()
+        return self.board.copy(), self.current_dice
 
     def place_number(self, row, col, number):
         if row < 0 or row > 4 or col < 0 or col > 4: return False
@@ -59,14 +62,29 @@ class Game:
         total += self.get_score(np.diagonal(self.board)) * 2
         total += self.get_score(np.diagonal(np.fliplr(self.board))) * 2
         return total
+    
+    def step(self, action):
+        row, col = action // 5, action % 5
+        # old_score = self.calculate_total_score()
+        valid_move = self.place_number(row, col, self.current_dice)
+        
+        # 3. 處理無效動作 (給予極大懲罰並提早結束，避免無窮迴圈)
+        if not valid_move:
+            return (self.board.copy(), self.current_dice), -100, True 
+        
+        new_score = self.calculate_total_score()
 
-# dicegame = Game()
-
-# while not dicegame.end_game():
-#     dice = dicegame.roll_dice()
-#     empty_cells = dicegame.get_empty_cells()
-#     if empty_cells:
-#         cell = random.choice(empty_cells)
-#         dicegame.place_number(cell[0], cell[1], dice)
-#         dicegame.display_board()
-#         print(f"Score: {dicegame.calculate_total_score()}")
+        # 4. 判斷遊戲是否結束與計分
+        done = self.end_game()
+        # 採用稀疏獎勵：只有遊戲結束才給總分，過程給 0 分
+        reward = self.calculate_total_score() if done else 0 
+        # reward = new_score - old_score
+        
+        # 5. 如果遊戲還沒結束，擲下一次骰子準備給下一個 State
+        if not done:
+            self.current_dice = self.roll_dice()
+        else:
+            self.current_dice = 0
+            # print(f"遊戲結束！最終分數: {new_score}")
+            
+        return (self.board.copy(), self.current_dice), reward, done

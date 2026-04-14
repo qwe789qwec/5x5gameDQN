@@ -1,292 +1,148 @@
-from dicegame import Game
-import random
-import numpy as np
-from collections import deque
+from dicegame import gameEnv
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+import random
+from collections import deque
 
-
-# =========================
-# Environment Wrapper
-# =========================
-class DiceGameEnv:
+# --- 1. 神經網路模型 ---
+class DQN(nn.Module):
     def __init__(self):
-        self.game = Game()
-        self.current_number = None
+        super(DQN, self).__init__()
+        
+        # 盤面 one-hot 編碼後是 5x5x13 = 325 維 (0-12 的 One-hot)
+        self.fc_board1 = nn.Linear(325, 128)
+        self.fc_board2 = nn.Linear(128, 128)
+        
+        # 盤面輸出 128 維 + 骰子 13 維 = 141 維
+        self.fc_combined = nn.Linear(141, 256)
+        
+        # 最終輸出還是 25 個 Q 值 (對應 5x5 的 25 個格子)
+        self.fc_out = nn.Linear(256, 25) 
 
-    def reset(self):
-        self.game.reset_game()
-        self.current_number = self.game.roll_dice()
-        return self.get_state()
+    def forward(self, board_one_hot, dice_one_hot):
+        # 處理盤面 (輸入維度: batch_size x 325)
+        x = F.relu(self.fc_board1(board_one_hot))
+        x = F.relu(self.fc_board2(x))
+        
+        # 將 13 維的骰子 One-hot 直接串接進來
+        # 注意：這裡不需要再做 unsqueeze，因為 dice_one_hot 已經是 [batch_size, 13]
+        x = torch.cat((x, dice_one_hot), dim=1) # 串接後變成 [batch_size, 141]
+        
+        x = F.relu(self.fc_combined(x))
+        q_values = self.fc_out(x)
+        return q_values
 
-    def get_state(self):
-        """
-        state:
-        - board: 5x5
-        - current dice number: 1 scalar
-        合併成 26 維向量
-        """
-        board_flat = self.game.board.flatten().astype(np.float32)
-        number = np.array([self.current_number], dtype=np.float32)
-        state = np.concatenate([board_flat, number])
-        return state
-
-    def get_valid_actions(self):
-        """
-        回傳可下的位置 index (0~24)
-        """
-        empty_cells = self.game.get_empty_cells()
-        return [r * 5 + c for r, c in empty_cells]
-
-    def step(self, action):
-        """
-        action: 0~24
-        """
-        row = action // 5
-        col = action % 5
-
-        old_score = self.game.calculate_total_score()
-        success = self.game.place_number(row, col, self.current_number)
-
-        if not success:
-            # 非法動作直接給懲罰，並結束這回合 or 不結束都可以
-            reward = -5.0
-            done = True
-            return self.get_state(), reward, done
-
-        new_score = self.game.calculate_total_score()
-        reward = float(new_score - old_score)
-
-        done = self.game.end_game()
-
-        if not done:
-            self.current_number = self.game.roll_dice()
-
-        return self.get_state(), reward, done
-
-
-# =========================
-# Replay Buffer
-# =========================
+# --- 2. 經驗回放池 (Replay Buffer) ---
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
-
+    
     def push(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
-
+        
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-
-        return (
-            np.array(states, dtype=np.float32),
-            np.array(actions, dtype=np.int64),
-            np.array(rewards, dtype=np.float32),
-            np.array(next_states, dtype=np.float32),
-            np.array(dones, dtype=np.float32)
-        )
-
+        state, action, reward, next_state, done = map(np.stack, zip(*batch))
+        return state, action, reward, next_state, done
+    
     def __len__(self):
         return len(self.buffer)
 
-
-# =========================
-# Q Network
-# =========================
-class DQN(nn.Module):
-    def __init__(self, input_dim=26, output_dim=25):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-# =========================
-# Agent
-# =========================
+# --- 3. DQN 代理人 (Agent) ---
 class DQNAgent:
-    def __init__(self, device="cpu"):
-        self.device = device
-
-        self.policy_net = DQN().to(device)
-        self.target_net = DQN().to(device)
+    def __init__(self, lr=1e-3, gamma=0.99, epsilon=1.0, epsilon_decay=0.9995, epsilon_min=0.01):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy_net = DQN().to(self.device)
+        self.target_net = DQN().to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
-
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-3)
-        self.memory = ReplayBuffer(50000)
-
-        self.gamma = 0.99
+        
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.memory = ReplayBuffer(10000)
+        
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
         self.batch_size = 64
 
-        self.epsilon = 1.0
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.995
+    def format_state(self, board, dice):
+        # 將盤面轉為 One-hot (5x5x13)
+        board_one_hot = np.zeros((5, 5, 13), dtype=np.float32)
+        for r in range(5):
+            for c in range(5):
+                val = board[r, c]
+                board_one_hot[r, c, val] = 1.0 
 
-    def select_action(self, state, valid_actions):
-        """
-        epsilon-greedy + mask 無效動作
-        """
+        # 骰子也轉為 One-hot (13維)
+        dice_one_hot = np.zeros(13, dtype=np.float32)
+        dice_one_hot[dice] = 1.0
+
+        return board_one_hot.flatten(), dice_one_hot
+
+    def select_action(self, board, dice, empty_cells):
         if random.random() < self.epsilon:
-            return random.choice(valid_actions)
+            # 隨機探索：從「空位」中隨機選一個
+            idx = random.choice(range(len(empty_cells)))
+            row, col = empty_cells[idx]
+            action = row * 5 + col
+            return action
 
-        state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            q_values = self.policy_net(state_tensor).squeeze(0).cpu().numpy()
+            board_flat, dice_val = self.format_state(board, dice)
+            board_t = torch.FloatTensor(board_flat).unsqueeze(0).to(self.device)
+            dice_t = torch.FloatTensor(dice_val).unsqueeze(0).to(self.device)
 
-        masked_q = np.full_like(q_values, -1e9, dtype=np.float32)
-        masked_q[valid_actions] = q_values[valid_actions]
-
-        return int(np.argmax(masked_q))
+            q_values = self.policy_net(board_t, dice_t).squeeze()
+            
+            # Action Masking (非常重要！把非空格的 Q 值設為極小)
+            mask = torch.ones(25, dtype=torch.bool).to(self.device)
+            for row, col in empty_cells:
+                mask[row * 5 + col] = False
+            q_values[mask] = -1e9 
+            
+            return q_values.argmax().item()
 
     def train_step(self):
         if len(self.memory) < self.batch_size:
-            return None
+            return
 
         states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
+        
+        # 解析狀態
+        boards = torch.FloatTensor(states[:, 0:325]).to(self.device)
+        dices = torch.FloatTensor(states[:, 325:]).to(self.device)
+        
+        next_boards = torch.FloatTensor(next_states[:, 0:325]).to(self.device)
+        next_dices = torch.FloatTensor(next_states[:, 325:]).to(self.device)
+        
+        actions = torch.LongTensor(actions).unsqueeze(1).to(self.device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
+        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
 
-        states = torch.tensor(states, dtype=torch.float32, device=self.device)
-        actions = torch.tensor(actions, dtype=torch.int64, device=self.device).unsqueeze(1)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_states = torch.tensor(next_states, dtype=torch.float32, device=self.device)
-        dones = torch.tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
-
-        current_q = self.policy_net(states).gather(1, actions)
-
+        # 計算目前的 Q 值
+        curr_q = self.policy_net(boards, dices).gather(1, actions)
+        
+        # 計算目標 Q 值 (Double DQN 概念，這裡簡化為一般 DQN)
         with torch.no_grad():
-            next_q = self.target_net(next_states).max(dim=1, keepdim=True)[0]
-            target_q = rewards + (1 - dones) * self.gamma * next_q
+            # 注意：在計算 next_q 時，我們無法預測未來的骰子點數。
+            # 為了簡化，如果遊戲沒結束，我們取未來所有可能行動的最大 Q 值。
+            # 更嚴謹的做法應該是計算未來骰子點數的期望值 (Expected Sarsa)，但一般 DQN 這裡先取 max。
+            next_q = self.target_net(next_boards, next_dices).max(1)[0].unsqueeze(1)
+            target_q = rewards + (self.gamma * next_q * (1 - dones))
 
-        loss = nn.MSELoss()(current_q, target_q)
-
+        loss = F.mse_loss(curr_q, target_q)
+        
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        return loss.item()
-
-    def update_target(self):
+    def update_target_network(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
-    def decay_epsilon(self):
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
-
-# =========================
-# Training Loop
-# =========================
-def train(num_episodes=3000, target_update=50, save_path="dqn_dicegame.pth"):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Using device:", device)
-
-    env = DiceGameEnv()
-    agent = DQNAgent(device=device)
-
-    reward_history = []
-    score_history = []
-    loss_history = []
-
-    for episode in range(1, num_episodes + 1):
-        state = env.reset()
-        done = False
-        total_reward = 0.0
-        losses = []
-
-        while not done:
-            valid_actions = env.get_valid_actions()
-            action = agent.select_action(state, valid_actions)
-
-            next_state, reward, done = env.step(action)
-
-            agent.memory.push(state, action, reward, next_state, done)
-            loss = agent.train_step()
-            if loss is not None:
-                losses.append(loss)
-
-            state = next_state
-            total_reward += reward
-
-        final_score = env.game.calculate_total_score()
-        reward_history.append(total_reward)
-        score_history.append(final_score)
-
-        if losses:
-            loss_history.append(np.mean(losses))
-        else:
-            loss_history.append(0.0)
-
-        agent.decay_epsilon()
-
-        if episode % target_update == 0:
-            agent.update_target()
-
-        if episode % 100 == 0:
-            avg_reward = np.mean(reward_history[-100:])
-            avg_score = np.mean(score_history[-100:])
-            avg_loss = np.mean(loss_history[-100:])
-            print(
-                f"Episode {episode:4d} | "
-                f"Avg Reward: {avg_reward:6.2f} | "
-                f"Avg Score: {avg_score:6.2f} | "
-                f"Avg Loss: {avg_loss:8.4f} | "
-                f"Epsilon: {agent.epsilon:.3f}"
-            )
-
-    torch.save(agent.policy_net.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
-
-
-# =========================
-# Evaluation
-# =========================
-def evaluate(model_path="dqn_dicegame.pth", num_games=10):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    env = DiceGameEnv()
-    model = DQN().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-
-    scores = []
-
-    for game_idx in range(num_games):
-        state = env.reset()
-        done = False
-
-        while not done:
-            valid_actions = env.get_valid_actions()
-
-            state_tensor = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            with torch.no_grad():
-                q_values = model(state_tensor).squeeze(0).cpu().numpy()
-
-            masked_q = np.full_like(q_values, -1e9, dtype=np.float32)
-            masked_q[valid_actions] = q_values[valid_actions]
-            action = int(np.argmax(masked_q))
-
-            state, reward, done = env.step(action)
-
-        final_score = env.game.calculate_total_score()
-        scores.append(final_score)
-
-        print(f"Game {game_idx + 1}: score = {final_score}")
-        env.game.display_board()
-        print("-" * 30)
-
-    print("Average score:", np.mean(scores))
-
-
-if __name__ == "__main__":
-    train(num_episodes=3000)
-    evaluate(num_games=5)
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
